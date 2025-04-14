@@ -209,14 +209,6 @@ def show_feedback_dialog():
                 return False, None
             else:
                 st.success("Thank you for your feedback!")
-                # Here you could save the feedback to a database or file if needed
-                # For example: save_feedback_to_db(feedback)
-                
-                # Reset the app state to allow processing another PDF
-                # if "pdf_processed" in st.session_state:
-                #     st.session_state.pop("pdf_processed")
-                # if "feedback_submitted" not in st.session_state:
-                #     st.session_state["feedback_submitted"] = True
                 return True, feedback
     return False, None
 
