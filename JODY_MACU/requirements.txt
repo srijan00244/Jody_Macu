@@ -3,3 +3,4 @@ pandas
 anthropic
 google-auth
 google-api-python-client
+gspread
