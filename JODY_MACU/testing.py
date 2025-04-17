@@ -87,38 +87,67 @@ def analyze_pdf(pdf_data_bytes, user_prompt: str):
         }
     ]
 
-    with st.spinner("Analyzing transcript... This may take a moment."):
-        message = client.messages.create(
-            model="claude-3-7-sonnet-latest",
-            max_tokens=4000,
-            messages=messages_payload
-        )
+    try:
+        with st.spinner("Analyzing transcript... This may take a moment."):
+            message = client.messages.create(
+                model="claude-3-7-sonnet-latest",
+                max_tokens=4000,
+                messages=messages_payload
+            )
 
-    # Calculate and display token usage
-    cache_creation_input_tokens = message.usage.cache_creation_input_tokens
-    cache_read_input_tokens = message.usage.cache_read_input_tokens
-    input_tokens = message.usage.input_tokens
-    output_tokens = message.usage.output_tokens
-    # Calculate pricing based on tokens usage (price per million tokens)
-    base_input_cost = input_tokens * 3.00 / 1e6
-    cache_writes_cost = cache_creation_input_tokens * 3.75 / 1e6
-    cache_hits_cost = cache_read_input_tokens * 0.30 / 1e6
-    output_cost = output_tokens * 15.00 / 1e6
-    total_cost = base_input_cost + cache_writes_cost + cache_hits_cost + output_cost
+        # Calculate and display token usage
+        cache_creation_input_tokens = message.usage.cache_creation_input_tokens
+        cache_read_input_tokens = message.usage.cache_read_input_tokens
+        input_tokens = message.usage.input_tokens
+        output_tokens = message.usage.output_tokens
+        # Calculate pricing based on tokens usage (price per million tokens)
+        base_input_cost = input_tokens * 3.00 / 1e6
+        cache_writes_cost = cache_creation_input_tokens * 3.75 / 1e6
+        cache_hits_cost = cache_read_input_tokens * 0.30 / 1e6
+        output_cost = output_tokens * 15.00 / 1e6
+        total_cost = base_input_cost + cache_writes_cost + cache_hits_cost + output_cost
 
-    # Create token usage message for display in an expander
-    token_usage = f"""
-    **Tokens Used:** {input_tokens + output_tokens}
+        # Create token usage message for display in an expander
+        token_usage = f"""
+        **Tokens Used:** {input_tokens + output_tokens}
+        
+        **Pricing Breakdown:**
+        - Base Input Cost: ${base_input_cost:.6f}
+        - Cache Writes Cost: ${cache_writes_cost:.6f}
+        - Cache Hits Cost: ${cache_hits_cost:.6f}
+        - Output Cost: ${output_cost:.6f}
+        - **Total Cost:** ${total_cost:.6f}
+        """
+
+        return message.content[0].text, token_usage
     
-    **Pricing Breakdown:**
-    - Base Input Cost: ${base_input_cost:.6f}
-    - Cache Writes Cost: ${cache_writes_cost:.6f}
-    - Cache Hits Cost: ${cache_hits_cost:.6f}
-    - Output Cost: ${output_cost:.6f}
-    - **Total Cost:** ${total_cost:.6f}
-    """
-
-    return message.content[0].text, token_usage
+    except anthropic.APIStatusError as e:
+        # Handle specific HTTP status codes
+        if e.status_code == 529:
+            st.error("⚠️ Claude is currently experiencing high demand. Please try again in a few minutes.")
+        elif e.status_code == 429:
+            st.error("⚠️ API rate limit exceeded. Please wait a moment before trying again.")
+        elif e.status_code >= 500:
+            st.error("⚠️ Claude service is temporarily unavailable. Please try again later.")
+        else:
+            st.error(f"⚠️ API Error: {str(e)}")
+        return None, None
+        
+    except anthropic.APIConnectionError:
+        st.error("⚠️ Connection to Claude API failed. Please check your internet connection and try again.")
+        return None, None
+        
+    except anthropic.APITimeoutError:
+        st.error("⚠️ The request to Claude timed out. This PDF may be too complex or the service is busy. Please try again later.")
+        return None, None
+        
+    except anthropic.AuthenticationError:
+        st.error("⚠️ Authentication to Claude API failed. Please contact the administrator to check API credentials.")
+        return None, None
+        
+    except Exception as e:
+        st.error(f"⚠️ An unexpected error occurred: {str(e)}")
+        return None, None
 
 def extract_json(text):
     match = re.search(r'```json\n(.*?)\n```', text, re.DOTALL)
@@ -417,7 +446,6 @@ def main():
 
     # Step 2: Show app functionality after successful login
     st.success("Access granted. You may now upload and analyze transcripts.")
-    
     # If feedback has not been submitted after processing a PDF, show the feedback dialog
     if st.session_state.get("pdf_processed", False) and not st.session_state.get("feedback_submitted", False):
         feedback_submitted, feedback_text = show_feedback_dialog()
@@ -433,7 +461,6 @@ def main():
             if success:
                 st.session_state["drive_upload_status"] = "success"
                 st.success(f"PDF successfully saved to Google Drive!")
-                
                 sheet_success = False
                 sheet_message = ""
                 
