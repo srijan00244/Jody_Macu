@@ -4,3 +4,7 @@ anthropic
 google-auth
 google-api-python-client
 gspread
+google-auth-oauthlib
+google-auth-httplib2
+PyPDF2
+pyarrow
