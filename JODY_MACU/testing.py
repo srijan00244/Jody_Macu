@@ -11,9 +11,9 @@ import shutil
 import tempfile
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.http import MediaFileUpload
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-
 def check_password():
     """Returns True if the user entered the correct password."""
     def password_entered():
@@ -35,12 +35,9 @@ def check_password():
         return True
 
 def grade_to_points(grade):
-    """Convert letter grade to numerical points."""
     grade = grade.upper().strip()
-    # Handle plus/minus modifiers
     base_grade = grade[0]
     modifier = grade[1:] if len(grade) > 1 else ""
-    # Base grade values
     grade_values = {
         'A': 4.0,
         'B': 3.0,
@@ -49,7 +46,6 @@ def grade_to_points(grade):
         'F': 0.0
     }
     
-    # Get base value
     if base_grade not in grade_values:
         return None  # Handle non-standard grades like P, W, etc.
     
@@ -63,9 +59,7 @@ def grade_to_points(grade):
     return base_value
 
 def analyze_pdf(pdf_data_bytes, user_prompt: str):
-    # Initialize Anthropic client - consider using st.secrets for API key in production
     client = anthropic.Anthropic(api_key=st.secrets["anthropic_api_key"])
-    # Encode PDF data
     pdf_data = base64.b64encode(pdf_data_bytes).decode("utf-8")
     messages_payload = [
         {
@@ -91,35 +85,11 @@ def analyze_pdf(pdf_data_bytes, user_prompt: str):
         with st.spinner("Analyzing transcript... This may take a moment."):
             message = client.messages.create(
                 model="claude-3-7-sonnet-latest",
-                max_tokens=4000,
+                max_tokens=8000,
                 messages=messages_payload
             )
 
-        # Calculate and display token usage
-        cache_creation_input_tokens = message.usage.cache_creation_input_tokens
-        cache_read_input_tokens = message.usage.cache_read_input_tokens
-        input_tokens = message.usage.input_tokens
-        output_tokens = message.usage.output_tokens
-        # Calculate pricing based on tokens usage (price per million tokens)
-        base_input_cost = input_tokens * 3.00 / 1e6
-        cache_writes_cost = cache_creation_input_tokens * 3.75 / 1e6
-        cache_hits_cost = cache_read_input_tokens * 0.30 / 1e6
-        output_cost = output_tokens * 15.00 / 1e6
-        total_cost = base_input_cost + cache_writes_cost + cache_hits_cost + output_cost
-
-        # Create token usage message for display in an expander
-        token_usage = f"""
-        **Tokens Used:** {input_tokens + output_tokens}
-        
-        **Pricing Breakdown:**
-        - Base Input Cost: ${base_input_cost:.6f}
-        - Cache Writes Cost: ${cache_writes_cost:.6f}
-        - Cache Hits Cost: ${cache_hits_cost:.6f}
-        - Output Cost: ${output_cost:.6f}
-        - **Total Cost:** ${total_cost:.6f}
-        """
-
-        return message.content[0].text, token_usage
+        return message.content[0].text
     
     except anthropic.APIStatusError as e:
         # Handle specific HTTP status codes
@@ -151,7 +121,6 @@ def analyze_pdf(pdf_data_bytes, user_prompt: str):
 
 def extract_json(text):
     match = re.search(r'```json\n(.*?)\n```', text, re.DOTALL)
-
     if match:
         json_str = match.group(1).strip()
         try:
@@ -163,7 +132,6 @@ def extract_json(text):
     return None
 
 def post_process_transcript_data(json_data):
-    """Post-process the JSON data to ensure credits are correctly calculated."""
     for term in json_data:
         for course in term.get("courses", []):
             # If credits are missing but points and grade are available
@@ -178,6 +146,167 @@ def post_process_transcript_data(json_data):
                         pass
     return json_data
 
+def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
+    if macu_df.empty:
+        st.warning("No CEP mapping data available.")
+        
+    expected_columns = ['CourseCode', 'CommonCode', 'Institution', 'CommonCourseTitle']
+    available_columns = macu_df.columns.tolist() if not macu_df.empty else []
+    
+    def normalize(text):
+        if pd.isna(text) or text is None:
+            return ""
+        return str(text).strip().lower()
+    
+    if not macu_df.empty:
+        macu_df['course_code_normalized'] = macu_df['CourseCode'].apply(normalize)
+    
+    macu_only_df = pd.DataFrame()
+    common_to_macu = {}
+    
+    if not macu_df.empty and 'Institution' in available_columns:
+        macu_institution_filter = macu_df['Institution'].apply(lambda x: normalize(x) == 'macu')
+        macu_only_df = macu_df[macu_institution_filter].copy()
+    elif not macu_df.empty:
+        st.warning("Institution column not found in CEP data. Using all mapping data without filtering.")
+        macu_only_df = macu_df.copy()
+    
+    # Set up for title column - use expected column if available in CEP data
+    title_column = None
+    if not macu_df.empty:
+        if 'CommonCourseTitle' in available_columns:
+            title_column = 'CommonCourseTitle'
+        else:
+            possible_title_columns = [col for col in available_columns if 'title' in col.lower()]
+            if possible_title_columns:
+                title_column = possible_title_columns[0]
+            else:
+                st.warning("No column for course titles found in CEP data. Will use empty strings for titles.")
+    
+    # Create dictionary mapping CommonCode to MACU course details from CEP data
+    if not macu_only_df.empty:
+        for _, row in macu_only_df.iterrows():
+            common_code = normalize(row.get('CommonCode', ''))
+            if common_code:
+                common_to_macu[common_code] = {
+                    'course_code': row.get('CourseCode', ''),
+                    'course_title': row.get(title_column, '') if title_column else '',
+                    'source_sheet': row.get('source_sheet', '')
+                }
+    
+    # Phase 2: Setup for CEQMACU data
+    ceqmacu_available = False
+    if ceqmacu_df is not None and not ceqmacu_df.empty:
+        ceqmacu_available = True
+        ceqmacu_df['send_course_code_normalized'] = ceqmacu_df['SendCourse1CourseCode'].apply(normalize)
+    
+    # Count variables for tracking matches
+    total_courses = 0
+    cep_matches = 0
+    macu_matches = 0
+    ceqmacu_matches = 0
+    sheet_matches = {'Sheet1': 0, 'Sheet2': 0, 'Sheet3': 0, 'Sheet4': 0, 'Sheet5': 0, 'Sheet7': 0}
+    
+    for term in json_data:
+        for course in term.get("courses", []):
+            total_courses += 1
+            # Get the course code and year from transcript
+            transcript_course_code = normalize(course.get("course_code", ""))
+            course_year = int(term.get("year", "0"))
+            if not transcript_course_code:
+                continue
+            
+            cep_match_found = False
+            if not macu_df.empty:
+                matching_rows = macu_df[macu_df['course_code_normalized'] == transcript_course_code]
+                
+                if not matching_rows.empty:
+                    match = matching_rows.iloc[0]
+                    common_code = normalize(match.get('CommonCode', ''))
+                    source_sheet = match.get('source_sheet', 'unknown')
+                    
+                    course["cep_match"] = True
+                    course["common_code"] = common_code
+                    course["source_sheet"] = source_sheet
+                    cep_matches += 1
+                    cep_match_found = True
+                    if source_sheet in sheet_matches:
+                        sheet_matches[source_sheet] += 1
+                    
+                    # Use CommonCode to find MACU equivalent
+                    if common_code and common_code in common_to_macu:
+                        macu_course = common_to_macu[common_code]
+                        course["macu_course_code"] = macu_course.get('course_code', '')
+                        course["macu_course_title"] = macu_course.get('course_title', '')
+                        course["data_from"] = f"CEP (Sheet {macu_course.get('source_sheet', '')})"
+                        macu_matches += 1
+            
+            # Phase 2: If no match in CEP data, try CEQMACU data
+            if not cep_match_found and ceqmacu_available:
+                ceqmacu_matches_df = ceqmacu_df[ceqmacu_df['send_course_code_normalized'] == transcript_course_code]
+                if not ceqmacu_matches_df.empty:
+                    valid_year_matches = []
+                    
+                    for _, row in ceqmacu_matches_df.iterrows():
+                        try:
+                            low_year = int(row.get('SendEditionLowYear', 0))
+                            if course_year >= low_year:
+                                valid_year_matches.append(row)
+                        except (ValueError, TypeError):
+                            # If year conversion fails, include the row anyway
+                            valid_year_matches.append(row)
+                    
+                    # If we have valid matches, use the first one
+                    if valid_year_matches:
+                        match = valid_year_matches[0]
+                        course["ceqmacu_match"] = True
+                        course["macu_course_code"] = match.get('ReceiveCourse1CourseCode', '')
+                        course["macu_course_title"] = match.get('ReceiveCourse1CourseTitle', '')
+                        course["macu_credits"] = match.get('ReceiveCourse1Units', '')
+                        course["data_from"] = "CEQMACU"
+                        ceqmacu_matches += 1
+    
+    return json_data
+
+def load_ceqmacu_mappings():
+    try:
+        import gspread
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=[
+                'https://www.googleapis.com/auth/spreadsheets.readonly',
+                'https://www.googleapis.com/auth/drive.readonly'
+            ]
+        )
+        
+        gc = gspread.authorize(credentials)
+        spreadsheet_id = "1kYt3L9YXPTyN4gmlJMRsUYy3arJhE0sT-Mtvg1v3FRI"
+        
+        try:
+            spreadsheet = gc.open_by_key(spreadsheet_id)
+        except Exception as e:
+            st.error(f"Failed to open CEQMACU spreadsheet: {str(e)}")
+            return pd.DataFrame()
+        
+        worksheet = spreadsheet.get_worksheet(0)  # Assuming data is in the first sheet
+        sheet_values = worksheet.get_all_values()
+        if not sheet_values or len(sheet_values) <= 1:
+            st.warning(f"CEQMACU sheet is empty or contains insufficient data")
+            return pd.DataFrame()
+        
+        # First row as headers
+        headers = sheet_values[0]
+        data = sheet_values[1:]
+        df = pd.DataFrame(data, columns=headers)
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error loading CEQMACU mappings from Google Sheets: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return pd.DataFrame()
+
 def get_term_code(term):
     """Convert term name to code."""
     term = term.lower()
@@ -190,7 +319,6 @@ def get_term_code(term):
     return ""
 
 def display_transcript_data(json_data):
-    """Display transcript data in tables grouped by term."""
     if not json_data:
         st.error("No data to display")
         return
@@ -199,14 +327,12 @@ def display_transcript_data(json_data):
         term = term_data.get("term", "")
         year = term_data.get("year", "")
         term_code = get_term_code(term)
-        # Create header for each term
         st.subheader(f"{term} - {year} [{term_code}]")
         courses = term_data.get("courses", [])
         if not courses:
             st.write("No courses found for this term")
             continue
             
-        # Create DataFrame for this term's courses
         df = pd.DataFrame([
             {
                 "Course Code": course.get("course_code", ""),
@@ -214,16 +340,17 @@ def display_transcript_data(json_data):
                 "Title": course.get("title", ""),
                 "Short Title": course.get("short_title", ""),
                 "Credit": course.get("credits", ""),
-                "Grade": course.get("grade", "")
+                "Grade": course.get("grade", ""),
+                "MACU Course Code": course.get("macu_course_code", ""),
+                "MACU Course Title": course.get("macu_course_title", ""),
+                "MACU Credits": course.get("macu_credits", ""),
+                "Data From": course.get("data_from", "")
             }
             for course in courses
         ])
-        
-        # Display the data as a table
         st.table(df)
 
 def show_feedback_dialog():
-    """Show feedback dialog and validate input."""
     with st.form(key="feedback_form"):
         st.subheader("Feedback")
         feedback = st.text_area(
@@ -245,28 +372,20 @@ def save_pdf_to_drive(pdf_bytes: bytes, filename: str):
     temp_file = None
     temp_file_path = None
     try:
-        # ==== CONFIGURATION ====
         SCOPES = ['https://www.googleapis.com/auth/drive']
-        
-        # ==== AUTHENTICATION ====
         credentials = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"], scopes=SCOPES
         )
         drive_service = build('drive', 'v3', credentials=credentials)
-
-        # Create a temporary file with a unique name
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp:
             temp.write(pdf_bytes)
             temp_file_path = temp.name
         
-        # ==== FILE METADATA ====
         file_metadata = {
             'name': filename,
             'mimeType': 'application/pdf',
             'parents': ['1z_N8QcDkRLbMjqvDDZtO1UX3sxCzx2Os']
         }
-        
-        # ==== FILE UPLOAD ====
         media = MediaFileUpload(temp_file_path, mimetype='application/pdf', resumable=True)
         
         file = drive_service.files().create(
@@ -275,14 +394,9 @@ def save_pdf_to_drive(pdf_bytes: bytes, filename: str):
             fields="id, name, webViewLink",
             supportsAllDrives=True
         ).execute()
-        
-        # Get the web view link (URL)
         file_url = file.get('webViewLink', '')
-        
-        # Give the system a moment before trying to delete the file
         import time
         time.sleep(0.5)
-        
         return True, f"PDF uploaded successfully: {file.get('name')}", file_url
     
     except Exception as e:
@@ -296,17 +410,13 @@ def save_pdf_to_drive(pdf_bytes: bytes, filename: str):
                 os.close(os.open(temp_file_path, os.O_RDONLY))
                 os.remove(temp_file_path)
             except Exception as e:
-                # If deletion fails, log it but don't fail the whole operation
                 print(f"Warning: Could not delete temporary file: {str(e)}")
                 
 def save_to_google_sheet(file_url, json_data, user_comment):
     try:
-        # Import gspread
         import gspread
-        # Log debugging information
         st.write(f"File URL: {file_url}")
         st.write(f"JSON data type: {type(json_data)}")
-        st.write(f"User comment length: {len(user_comment)}")
         # Use service account info from secrets
         credentials = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"],
@@ -317,21 +427,75 @@ def save_to_google_sheet(file_url, json_data, user_comment):
         )
         # Create gspread client
         gc = gspread.authorize(credentials)
-        # Open the spreadsheet by ID
         spreadsheet_id = "15HvKDTzxiXueIGluwMQPKcZvess7QYSzda2yWmTZiwI"
         sheet = gc.open_by_key(spreadsheet_id).sheet1  # Using the first sheet
-        # Convert JSON data to string
         json_str = json.dumps(json_data)
-        # Prepare row data
         row_data = [file_url, json_str, user_comment]
-        # Append the row to the sheet
         sheet.append_row(row_data)
-        # Get the row number that was just added
         next_row = len(sheet.get_all_values())
         return True, f"Data saved to Google Sheet in row {next_row}"
     
     except Exception as e:
         return False, f"Failed to save to Google Sheet: {str(e)}"
+
+def load_macu_mappings_from_sheets():
+    try:
+        import gspread
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=[
+                'https://www.googleapis.com/auth/spreadsheets.readonly',
+                'https://www.googleapis.com/auth/drive.readonly'
+            ]
+        )
+        # Create gspread client
+        gc = gspread.authorize(credentials)
+        spreadsheet_id = "1p2_1E25dYfWWb2ugfsFSdDPss-ahzGBxaQ41YUkVRK4"
+        try:
+            spreadsheet = gc.open_by_key(spreadsheet_id)
+        except Exception as e:
+            st.error(f"Failed to open spreadsheet: {str(e)}")
+            return pd.DataFrame()
+            
+        # Define target sheets
+        target_sheets = ["Sheet1", "Sheet2", "Sheet3", "Sheet4", "Sheet5", "Sheet6"]
+        all_data = pd.DataFrame()
+        
+        for sheet_name in target_sheets:
+            try:
+                # Get the worksheet
+                try:
+                    sheet = spreadsheet.worksheet(sheet_name)
+                except gspread.exceptions.WorksheetNotFound:
+                    continue
+                    
+                # Get all values from the sheet
+                sheet_values = sheet.get_all_values()
+                
+                # Skip empty sheets
+                if not sheet_values or len(sheet_values) <= 2:  # Need at least header row + column names + one data row
+                    continue
+                    
+                headers = sheet_values[1]  # Second row as headers
+                data = sheet_values[2:]
+                df = pd.DataFrame(data, columns=headers)
+                df['source_sheet'] = sheet_name
+                
+                # Append to the main DataFrame
+                all_data = pd.concat([all_data, df], ignore_index=True)
+            except Exception as e:
+                st.error(f"Error loading data from sheet {sheet_name}: {str(e)}")
+                continue
+                
+        # Check if we got any data
+        if all_data.empty:
+            st.error("Failed to load any data from the spreadsheets")
+            return pd.DataFrame()
+            
+        return all_data
+    except Exception as e:
+        st.error(f"Error loading course mappings from Google Sheets: {str(e)}")
+        return pd.DataFrame()
                     
 # Prompt template for Claude
 PROMPT = """
@@ -422,7 +586,7 @@ Return the extracted data in the following **JSON structure**:
 - Make sure to extract and include the "points" field in the output as it's needed for credit calculation.
 - If any required information is missing from a course, leave the value as an empty string ("") rather than omitting the field.
 """
-# Streamlit app
+# Replace the original function with the new implementation
 def main():
     st.set_page_config(page_title="Transcript Analyzer", layout="wide")
     st.title("🔍 Academic Transcript Analyzer")
@@ -444,9 +608,7 @@ def main():
         st.warning("Please enter the password to access the transcript analyzer.")
         st.stop()  # Don't run the rest of the app until the correct password is entered
 
-    # Step 2: Show app functionality after successful login
     st.success("Access granted. You may now upload and analyze transcripts.")
-    # If feedback has not been submitted after processing a PDF, show the feedback dialog
     if st.session_state.get("pdf_processed", False) and not st.session_state.get("feedback_submitted", False):
         feedback_submitted, feedback_text = show_feedback_dialog()
         if feedback_submitted:
@@ -493,7 +655,6 @@ def main():
         uploaded_file = st.file_uploader("Choose a transcript PDF file", type="pdf")
         
         if uploaded_file is not None:
-            # Save uploaded file contents to session state
             pdf_bytes = uploaded_file.getvalue()
             st.session_state["pdf_bytes"] = pdf_bytes
             st.session_state["uploaded_file_name"] = uploaded_file.name
@@ -501,12 +662,19 @@ def main():
             # Process the transcript
             if st.button("Process Transcript"):
                 # Call Claude API to analyze the PDF
-                claude_response, token_usage = analyze_pdf(pdf_bytes, PROMPT)
+                claude_response = analyze_pdf(pdf_bytes, PROMPT)
                 # Extract JSON from Claude's response
                 json_data = extract_json(claude_response)
                 # Post-process the data
                 if json_data:
                     json_data = post_process_transcript_data(json_data)
+                    # Load mapping data from all sheets
+                    macu_df = load_macu_mappings_from_sheets()
+                    # Load CEQMACU mapping data
+                    ceqmacu_df = load_ceqmacu_mappings()
+                    # Enrich with MACU course equivalents
+                    json_data = enrich_with_macu_data(json_data, macu_df,ceqmacu_df)
+
                     st.session_state["json_data"] = json_data
                     # Display the data
                     st.success("Transcript processed successfully!")
@@ -517,11 +685,7 @@ def main():
                         file_name=f"{uploaded_file.name.split('.')[0]}_processed.json",
                         mime="application/json"
                     )
-                    
-                    # Display token usage details in an expander
-                    with st.expander("API Token Usage Details"):
-                        st.markdown(token_usage)
-                    
+                                        
                     # Display the transcript data in tables
                     display_transcript_data(json_data)
                     # Show raw JSON in an expander
@@ -531,13 +695,11 @@ def main():
                     # Set the state to show that a PDF has been processed
                     st.session_state["pdf_processed"] = True
                     st.session_state["feedback_submitted"] = False
-                    # Show feedback dialog after displaying results
                     st.markdown("---")
                     show_feedback_dialog()
                 else:
                     st.error("Failed to extract data from the transcript.")
-                    st.write("Raw response from Claude:")
                     st.text(claude_response)
-
+                    
 if __name__ == "__main__":
     main()
