@@ -298,12 +298,12 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
                             course["macu_course_title"] = macu_match.get('CommonCourseTitle', '')
                             # Add the original credits from the transcript to macu_credits
                             course["macu_credits"] = course.get("credits", "")
-                            course["data_from"] = f"CEP ({academic_year}) - Course Code Match"
+                            course["data_from"] = f"CEP "
                             macu_matches += 1
                             cep_match_found = True
                         else:
                             # Common code exists but no MACU institution match was found
-                            course["data_from"] = f"CEP ({academic_year}) - No MACU Equivalent"
+                            course["data_from"] = f" "
                             cep_match_found = False
             
             # If no match by course code, try the combined text approach for the current academic year
@@ -331,11 +331,11 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
                             course["macu_course_code"] = macu_match.get('CourseCode', '')
                             course["macu_course_title"] = macu_match.get('CommonCourseTitle', '')
                             course["macu_credits"] = course.get("credits", "")
-                            course["data_from"] = f"CEP ({academic_year}) - Exact Match"
+                            course["data_from"] = f"CEP "
                             macu_matches += 1
                             cep_match_found = True
                         else:
-                            course["data_from"] = f"CEP ({academic_year}) - No MACU Equivalent"
+                            course["data_from"] = f" "
                             cep_match_found = False
             
             # If no match in the current academic year, try other sheets by course code first
@@ -383,15 +383,15 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
                                 
                                 # Set data_from based on match type
                                 if match_type == "course_code_exact_different_year":
-                                    course["data_from"] = f"CEP ({sheet_name}) - Course Code Match"
+                                    course["data_from"] = f"CEP "
                                 else:
-                                    course["data_from"] = f"CEP ({sheet_name}) - Exact Match"
+                                    course["data_from"] = f"CEP "
                                     
                                 macu_matches += 1
                                 cep_match_found = True
                                 break  # Exit the loop once match is found
                             else:
-                                course["data_from"] = f"CEP ({sheet_name}) - No MACU Equivalent"
+                                course["data_from"] = f" "
                                 cep_match_found = False
                                 break  # Exit the loop once match is found
             
