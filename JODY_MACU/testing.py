@@ -515,7 +515,7 @@ def display_transcript_data(json_data):
                 "MACU Course Title": course.get("macu_course_title", ""),
                 "MACU Credits": course.get("macu_credits", ""),
                 "Data From": course.get("data_from", ""),
-                "CombineTitleCode": course.get("CombineTitleCode", ""),
+                #"CombineTitleCode": course.get("CombineTitleCode", ""),
             }
             for course in courses
         ])
