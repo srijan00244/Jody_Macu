@@ -89,7 +89,31 @@ def analyze_pdf(pdf_data_bytes, user_prompt: str):
                 messages=messages_payload
             )
 
-        return message.content[0].text
+        # Calculate and display token usage
+        cache_creation_input_tokens = message.usage.cache_creation_input_tokens
+        cache_read_input_tokens = message.usage.cache_read_input_tokens
+        input_tokens = message.usage.input_tokens
+        output_tokens = message.usage.output_tokens
+        # Calculate pricing based on tokens usage (price per million tokens)
+        base_input_cost = input_tokens * 3.00 / 1e6
+        cache_writes_cost = cache_creation_input_tokens * 3.75 / 1e6
+        cache_hits_cost = cache_read_input_tokens * 0.30 / 1e6
+        output_cost = output_tokens * 15.00 / 1e6
+        total_cost = base_input_cost + cache_writes_cost + cache_hits_cost + output_cost
+
+        # Create token usage message for display in an expander
+        token_usage = f"""
+        **Tokens Used:** {input_tokens + output_tokens}
+        
+        **Pricing Breakdown:**
+        - Base Input Cost: ${base_input_cost:.6f}
+        - Cache Writes Cost: ${cache_writes_cost:.6f}
+        - Cache Hits Cost: ${cache_hits_cost:.6f}
+        - Output Cost: ${output_cost:.6f}
+        - **Total Cost:** ${total_cost:.6f}
+        """
+
+        return message.content[0].text, token_usage
     
     except anthropic.APIStatusError as e:
         # Handle specific HTTP status codes
@@ -132,7 +156,18 @@ def extract_json(text):
     return None
 
 def post_process_transcript_data(json_data):
-    for term in json_data:
+    # Ensure json_data is a list and not empty before accessing elements
+    if json_data and isinstance(json_data, list) and len(json_data) > 0:
+        # Check if the first term has an institution field
+        if "institution" in json_data[0]:
+            institution_name = json_data[0].get("institution", "")
+            # Propagate to all terms
+            for term in json_data:
+                if "institution" not in term:
+                    term["institution"] = institution_name
+                
+    # Process each term's courses        
+    for term in json_data or []:
         for course in term.get("courses", []):
             # If credits are missing but points and grade are available
             if (not course.get("credits") or course["credits"] == "") and course.get("points") and course.get("grade"):
@@ -145,6 +180,91 @@ def post_process_transcript_data(json_data):
                         # Handle cases where conversion fails
                         pass
     return json_data
+def load_institution_mappings():
+    """Load institution name to code mappings from Google Sheet."""
+    try:
+        import gspread
+        credentials = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"],
+            scopes=[
+                'https://www.googleapis.com/auth/spreadsheets.readonly',
+                'https://www.googleapis.com/auth/drive.readonly'
+            ]
+        )
+        
+        gc = gspread.authorize(credentials)
+        spreadsheet_id = "122e-sqnpQWkue_uGxLLrcc7nuwBWppzUeh9cdp6vpRY"
+        
+        try:
+            spreadsheet = gc.open_by_key(spreadsheet_id)
+        except Exception as e:
+            st.error(f"Failed to open SchoolInstitutions spreadsheet: {str(e)}")
+            return pd.DataFrame()
+        
+        worksheet = spreadsheet.sheet1  # Using the first sheet
+        sheet_values = worksheet.get_all_values()
+        if not sheet_values or len(sheet_values) <= 1:
+            st.error("SchoolInstitutions sheet is empty or contains insufficient data")
+            return pd.DataFrame()
+        
+        headers = sheet_values[0]
+        data = sheet_values[1:]
+        df = pd.DataFrame(data, columns=headers)
+        
+        # Ensure the required columns exist
+        if "ORG_NAME" not in df.columns or "ORG_CDE" not in df.columns:
+            st.error("Required columns 'ORG_NAME' or 'ORG_CDE' not found in SchoolInstitutions sheet")
+            return pd.DataFrame()
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error loading institution mappings from Google Sheets: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return pd.DataFrame()
+def match_institution_code(institution_name, institution_df):
+
+    if institution_df.empty or not institution_name:
+        return ""
+    
+    # Normalize institution names for matching
+    institution_name = institution_name.lower().strip()
+    institution_df['ORG_NAME_NORMALIZED'] = institution_df['ORG_NAME'].str.lower().str.strip()
+    
+    # Try exact match first
+    exact_matches = institution_df[institution_df['ORG_NAME_NORMALIZED'] == institution_name]
+    
+    if not exact_matches.empty:
+        org_code = exact_matches.iloc[0]['ORG_CDE']
+    else:
+        # Try fuzzy matching if no exact match
+        import difflib
+        best_matches = difflib.get_close_matches(
+            institution_name, 
+            institution_df['ORG_NAME_NORMALIZED'].tolist(),
+            n=1,  # Get only the best match
+            cutoff=0.7  # Require at least 70% similarity
+        )
+        
+        if best_matches:
+            best_match = best_matches[0]
+            matching_rows = institution_df[institution_df['ORG_NAME_NORMALIZED'] == best_match]
+            if not matching_rows.empty:
+                org_code = matching_rows.iloc[0]['ORG_CDE']
+            else:
+                return ""
+        else:
+            return ""
+    
+    # Format org code to be 6 digits with leading zeros
+    try:
+        # Convert to integer to remove any leading zeros, then format to 6 digits
+        org_code = str(int(org_code)).zfill(6)
+        return org_code
+    except (ValueError, TypeError):
+        # If conversion fails (e.g., non-numeric code), return as is
+        return org_code
 
 def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
     if macu_df.empty:
@@ -161,9 +281,10 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
     
     # Determine which academic year sheet to use for each term
     def get_academic_year_sheet(term, year):
-        term = term.lower()
         year = int(year) if year.isdigit() else 0
+        term = term.lower()
         
+        # Map the term and year to appropriate academic year
         if "fall" in term:
             # Fall term is in the first year of an academic year span
             academic_year = f"{year}-{year+1}"
@@ -193,8 +314,7 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
     def extract_course_code(combined_text):
         if pd.isna(combined_text) or combined_text is None:
             return ""
-        # Pattern to match course code (e.g., "COMS 1223" from "COMS 1223 Programming Fundamentals")
-        # This matches alphanumeric characters, spaces, and dots until we hit multiple spaces or non-alphanumeric chars
+
         match = re.match(r'^([A-Za-z0-9\s\.]+?)(?:\s{2,}|\s+[^A-Za-z0-9\s\.])', str(combined_text))
         if match:
             return normalize(match.group(1))
@@ -213,7 +333,6 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
     macu_df['combine_normalized'] = macu_df[combine_column].apply(normalize)
     macu_df['common_code_normalized'] = macu_df['CommonCode'].apply(normalize)
     macu_df['course_code_extracted'] = macu_df[combine_column].apply(extract_course_code)
-    
     # Create a column with just the course code for secondary matching
     if 'CourseCode' in macu_df.columns:
         macu_df['course_code_normalized'] = macu_df['CourseCode'].apply(normalize)
@@ -239,137 +358,106 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
     cep_matches = 0
     macu_matches = 0
     ceqmacu_matches = 0
-    sheet_matches = {'2020-2021': 0, '2021-2022': 0, '2022-2023': 0, '2023-2024': 0, '2024-2025': 0, '2025-2026':0}
+    sheet_matches = {'2020-2021': 0, '2021-2022': 0, '2022-2023': 0, '2023-2024': 0, '2024-2025': 0, '2025-2026': 0}
+    older_courses = 0  # Count courses older than our available data
     
     for term in json_data:
         term_name = term.get("term", "")
         year = term.get("year", "")
+        year_int = int(year) if year.isdigit() else 0
         academic_year = get_academic_year_sheet(term_name, year)
         
+        # Flag to mark terms older than our available data
+        is_old_term = False
+        earliest_year = 2020  # Earliest year in our available sheets
+        
+        # Check if term is before our earliest data
+        if "fall" in term_name.lower():
+            if year_int < earliest_year:
+                is_old_term = True
+        elif "spring" in term_name.lower() or "summer" in term_name.lower():
+            if year_int <= earliest_year:  # For spring/summer 2020, academic year would be 2019-2020 which we don't have
+                is_old_term = True
+                
         # Get the appropriate academic year dataframe
         current_academic_year_df = academic_year_dfs.get(academic_year, pd.DataFrame())
         
         for course in term.get("courses", []):
             total_courses += 1
             
-            # Create the combined course code and title for matching
+            # Initialize match flags
+            course["cep_match"] = False
+            course["ceqmacu_match"] = False
+            course["macu_division"] = ""
             course_code = course.get("course_code", "")
             title = course.get("title", "")
             combined_text = f"{course_code} {title}"
-            
-            # Normalize combined text
             combined_normalized = normalize(combined_text)
             course_code_normalized = normalize(course_code)
-            
-            # Store the original combined value in the course object for display
             course["CombineTitleCode"] = combined_text
-            
-            # Add term info to the course for debugging
             course["term_academic_year"] = academic_year
             
-            cep_match_found = False
-
-            # MATCH METHOD 1: Try to find an exact match by course code only in the current academic year
-            if not current_academic_year_df.empty:
-                # First try an exact course code match
-                matching_rows = current_academic_year_df[current_academic_year_df['course_code_extracted'] == course_code_normalized]
+            # Mark courses from older terms explicitly
+            if is_old_term:
+                older_courses += 1
+                course["older_than_data"] = True
+                # For older terms, skip CEP matching and try CEQMACU directly
+                cep_match_found = False
                 
-                if not matching_rows.empty:
-                    # We found a matching course in the expected academic year sheet by course code
-                    match = matching_rows.iloc[0]
-                    common_code = normalize(match.get('CommonCode', ''))
-                    
-                    course["cep_match"] = True
-                    course["common_code"] = common_code
-                    course["source_sheet"] = academic_year
-                    course["matched_on"] = "course_code_exact"
-                    cep_matches += 1
-                    sheet_matches[academic_year] += 1
-                    
-                    # Find the MACU course with the same CommonCode
-                    if common_code:
-                        # Look for rows where Institution = "MACU" and CommonCode matches
-                        macu_matches_df = macu_institution_df[macu_institution_df['common_code_normalized'] == common_code]
-                        
-                        if not macu_matches_df.empty:
-                            # Found a MACU equivalent
-                            macu_match = macu_matches_df.iloc[0]
-                            course["macu_course_code"] = macu_match.get('CourseCode', '')
-                            course["macu_course_title"] = macu_match.get('CommonCourseTitle', '')
-                            # Add the original credits from the transcript to macu_credits
-                            course["macu_credits"] = course.get("credits", "")
-                            course["data_from"] = f"CEP "
-                            macu_matches += 1
-                            cep_match_found = True
-                        else:
-                            # Common code exists but no MACU institution match was found
-                            course["data_from"] = f" "
-                            cep_match_found = False
-            
-            # If no match by course code, try the combined text approach for the current academic year
-            if not cep_match_found and not current_academic_year_df.empty:
-                matching_rows = current_academic_year_df[current_academic_year_df['combine_normalized'] == combined_normalized]
+                # Add a note to indicate why no match was found
+                course["data_from"] = ""
+                course["no_match_reason"] = f"Term ({term_name} {year}) is before earliest available data (2020-2021)"
+            else:
+                course["older_than_data"] = False
+                cep_match_found = False
                 
-                if not matching_rows.empty:
-                    # Found a matching course by combined text
-                    match = matching_rows.iloc[0]
-                    common_code = normalize(match.get('CommonCode', ''))
-                    
-                    course["cep_match"] = True
-                    course["common_code"] = common_code
-                    course["source_sheet"] = academic_year
-                    course["matched_on"] = "combined_text_exact"
-                    cep_matches += 1
-                    sheet_matches[academic_year] += 1
-                    
-                    # Find the MACU course with the same CommonCode
-                    if common_code:
-                        macu_matches_df = macu_institution_df[macu_institution_df['common_code_normalized'] == common_code]
-                        
-                        if not macu_matches_df.empty:
-                            macu_match = macu_matches_df.iloc[0]
-                            course["macu_course_code"] = macu_match.get('CourseCode', '')
-                            course["macu_course_title"] = macu_match.get('CommonCourseTitle', '')
-                            course["macu_credits"] = course.get("credits", "")
-                            course["data_from"] = f"CEP "
-                            macu_matches += 1
-                            cep_match_found = True
-                        else:
-                            course["data_from"] = f" "
-                            cep_match_found = False
-            
-            # If no match in the current academic year, try other sheets by course code first
-            if not cep_match_found:
-                # Search all other sheets in reverse order (newest first)
-                for sheet_name in reversed(available_sheets):
-                    # Skip if it's the same as the current academic year we already checked
-                    if sheet_name == academic_year:
-                        continue
-                        
-                    sheet_df = academic_year_dfs.get(sheet_name, pd.DataFrame())
-                    if sheet_df.empty:
-                        continue
-                    
-                    # First try to match by course code
-                    matching_rows = sheet_df[sheet_df['course_code_extracted'] == course_code_normalized]
-                    match_type = "course_code_exact_different_year"
-                    
-                    # If no match by course code, try combined text
-                    if matching_rows.empty:
-                        matching_rows = sheet_df[sheet_df['combine_normalized'] == combined_normalized]
-                        match_type = "combined_text_exact_different_year"
-                    
+                # MATCH METHOD 1: Try to find an exact match by course code only in the current academic year
+                if not current_academic_year_df.empty:
+                    # First try an exact course code match
+                    matching_rows = current_academic_year_df[current_academic_year_df['course_code_extracted'] == course_code_normalized]
                     if not matching_rows.empty:
-                        # Found a match in another sheet
+                        # We found a matching course in the expected academic year sheet by course code
                         match = matching_rows.iloc[0]
                         common_code = normalize(match.get('CommonCode', ''))
-                        
                         course["cep_match"] = True
                         course["common_code"] = common_code
-                        course["source_sheet"] = sheet_name  # Use the actual sheet where match was found
-                        course["matched_on"] = match_type
+                        course["source_sheet"] = academic_year
+                        course["matched_on"] = "course_code_exact"
                         cep_matches += 1
-                        sheet_matches[sheet_name] += 1
+                        sheet_matches[academic_year] += 1
+                        # Find the MACU course with the same CommonCode
+                        if common_code:
+                            # Look for rows where Institution = "MACU" and CommonCode matches
+                            macu_matches_df = macu_institution_df[macu_institution_df['common_code_normalized'] == common_code]
+                            if not macu_matches_df.empty:
+                                # Found a MACU equivalent
+                                macu_match = macu_matches_df.iloc[0]
+                                course["macu_course_code"] = macu_match.get('CourseCode', '').replace(' ', '')
+                                course["macu_course_title"] = macu_match.get('CommonCourseTitle', '')
+                                course["macu_credits"] = course.get("credits", "")
+                                course["data_from"] = "CEP"
+                                course["macu_division"] = "C" if course.get("division", "") == "UNDG" else ""
+                                macu_matches += 1
+                                cep_match_found = True
+                            else:
+                                # Common code exists but no MACU institution match was found
+                                course["data_from"] = " "
+                                course["no_match_reason"] = "Common code found but no matching MACU course"
+                                cep_match_found = True  # We did find a CEP match, just not a MACU match
+                
+                # If no match by course code, try the combined text approach for the current academic year
+                if not cep_match_found and not current_academic_year_df.empty:
+                    matching_rows = current_academic_year_df[current_academic_year_df['combine_normalized'] == combined_normalized]
+                    if not matching_rows.empty:
+                        # Found a matching course by combined text
+                        match = matching_rows.iloc[0]
+                        common_code = normalize(match.get('CommonCode', ''))
+                        course["cep_match"] = True
+                        course["common_code"] = common_code
+                        course["source_sheet"] = academic_year
+                        course["matched_on"] = "combined_text_exact"
+                        cep_matches += 1
+                        sheet_matches[academic_year] += 1
                         
                         # Find the MACU course with the same CommonCode
                         if common_code:
@@ -377,23 +465,76 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
                             
                             if not macu_matches_df.empty:
                                 macu_match = macu_matches_df.iloc[0]
-                                course["macu_course_code"] = macu_match.get('CourseCode', '')
+                                course["macu_course_code"] = macu_match.get('CourseCode', '').replace(' ', '')
                                 course["macu_course_title"] = macu_match.get('CommonCourseTitle', '')
                                 course["macu_credits"] = course.get("credits", "")
-                                
-                                # Set data_from based on match type
-                                if match_type == "course_code_exact_different_year":
-                                    course["data_from"] = f"CEP "
-                                else:
-                                    course["data_from"] = f"CEP "
-                                    
+                                course["data_from"] = "CEP"
+                                course["macu_division"] = "C" if course.get("division", "") == "UNDG" else ""
                                 macu_matches += 1
                                 cep_match_found = True
-                                break  # Exit the loop once match is found
                             else:
-                                course["data_from"] = f" "
-                                cep_match_found = False
-                                break  # Exit the loop once match is found
+                                course["data_from"] = ""
+                                course["no_match_reason"] = "Common code found but no matching MACU course"
+                                cep_match_found = True
+                
+                # If no match in the current academic year, try other sheets by course code first
+                if not cep_match_found:
+                    # Sort available sheets to try the closest years first
+                    # For example, if academic_year is "2023-2024", try "2022-2023" before "2020-2021"
+                    try:
+                        target_year = int(academic_year.split('-')[0])
+                        sorted_sheets = sorted(available_sheets, 
+                                           key=lambda x: abs(int(x.split('-')[0]) - target_year))
+                    except (ValueError, IndexError):
+                        # If parsing fails, use the default order
+                        sorted_sheets = available_sheets
+                    
+                    for sheet_name in sorted_sheets:
+                        # Skip if it's the same as the current academic year we already checked
+                        if sheet_name == academic_year:
+                            continue
+                            
+                        sheet_df = academic_year_dfs.get(sheet_name, pd.DataFrame())
+                        if sheet_df.empty:
+                            continue
+                        
+                        # First try to match by course code
+                        matching_rows = sheet_df[sheet_df['course_code_extracted'] == course_code_normalized]
+                        match_type = "course_code_exact_different_year"
+                        # If no match by course code, try combined text
+                        if matching_rows.empty:
+                            matching_rows = sheet_df[sheet_df['combine_normalized'] == combined_normalized]
+                            match_type = "combined_text_exact_different_year"
+                        
+                        if not matching_rows.empty:
+                            # Found a match in another sheet
+                            match = matching_rows.iloc[0]
+                            common_code = normalize(match.get('CommonCode', ''))
+                            course["cep_match"] = True
+                            course["common_code"] = common_code
+                            course["source_sheet"] = sheet_name  # Use the actual sheet where match was found
+                            course["matched_on"] = match_type
+                            cep_matches += 1
+                            sheet_matches[sheet_name] += 1
+                            # Find the MACU course with the same CommonCode
+                            if common_code:
+                                macu_matches_df = macu_institution_df[macu_institution_df['common_code_normalized'] == common_code]
+                                
+                                if not macu_matches_df.empty:
+                                    macu_match = macu_matches_df.iloc[0]
+                                    course["macu_course_code"] = macu_match.get('CourseCode', '').replace(' ', '')
+                                    course["macu_course_title"] = macu_match.get('CommonCourseTitle', '')
+                                    course["macu_credits"] = course.get("credits", "")
+                                    course["data_from"] = "CEP"
+                                    course["macu_division"] = "C" if course.get("division", "") == "UNDG" else ""
+                                    macu_matches += 1
+                                    cep_match_found = True
+                                    break  # Exit the loop once match is found
+                                else:
+                                    course["data_from"] = "S"
+                                    course["no_match_reason"] = "Common code found but no matching MACU course"
+                                    cep_match_found = True
+                                    break  # Exit the loop once match is found
             
             # MATCH METHOD 4: If no match in CEP data, try CEQMACU data
             if not cep_match_found and ceqmacu_available:
@@ -414,12 +555,27 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
                     if valid_year_matches:
                         match = valid_year_matches[0]
                         course["ceqmacu_match"] = True
-                        course["macu_course_code"] = match.get('ReceiveCourse1CourseCode', '')
+                        course["macu_course_code"] = match.get('ReceiveCourse1CourseCode', '').replace(' ', '')
                         course["macu_course_title"] = match.get('ReceiveCourse1CourseTitle', '')
                         course["macu_credits"] = match.get('ReceiveCourse1Units', '')
                         course["data_from"] = "CEQMACU"
                         course["matched_on"] = "ceqmacu_course_code"
+                        # Add MACU Division
+                        course["macu_division"] = "C" if course.get("division", "") == "UNDG" else ""
                         ceqmacu_matches += 1
+                    elif is_old_term:
+                        # If this is an old term and we couldn't find a match in CEQMACU either
+                        course["no_match_reason"] = f"Term ({term_name} {year}) is before earliest available data (2020-2021) and no CEQMACU match found"
+            
+            # Add "NO_MATCH" for data_from if we didn't find any match
+            if not course.get("data_from"):
+                course["data_from"] = " "
+                # If no explicit reason was set, add a generic one
+                if not course.get("no_match_reason"):
+                    if is_old_term:
+                        course["no_match_reason"] = f"Term ({term_name} {year}) is before earliest available data (2020-2021)"
+                    else:
+                        course["no_match_reason"] = "No matching course found in any available data source"
     
     # Add match statistics as metadata
     match_stats = {
@@ -427,10 +583,10 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
         "cep_matches": cep_matches,
         "macu_matches": macu_matches,
         "ceqmacu_matches": ceqmacu_matches,
+        "older_courses": older_courses,
         "sheet_matches": sheet_matches
     }
     
-    # Add the match statistics to the first term if possible
     if json_data and len(json_data) > 0:
         json_data[0]["match_statistics"] = match_stats
     
@@ -448,7 +604,6 @@ def load_ceqmacu_mappings():
         
         gc = gspread.authorize(credentials)
         spreadsheet_id = "12CpxGQMyTa_cwyY0B-iomDgflD24kjYFYPLWljD6Jgo"
-        
         try:
             spreadsheet = gc.open_by_key(spreadsheet_id)
             # Removed success message
@@ -462,13 +617,9 @@ def load_ceqmacu_mappings():
             st.warning(f"CEQMACU sheet is empty or contains insufficient data")
             return pd.DataFrame()
         
-        # First row as headers
         headers = sheet_values[0]
         data = sheet_values[1:]
         df = pd.DataFrame(data, columns=headers)
-        
-        # Removed expander for sample data
-        
         return df
         
     except Exception as e:
@@ -489,9 +640,27 @@ def get_term_code(term):
     return ""
 
 def display_transcript_data(json_data):
-    if not json_data:
+    if not json_data or not isinstance(json_data, list) or len(json_data) == 0:
         st.error("No data to display")
         return
+    
+    # Use the institution dataframe from session state instead of loading it again
+    institution_df = st.session_state.get("institution_df", pd.DataFrame())
+    
+    # Get institution name from the first term
+    institution = json_data[0].get("institution", "")
+    
+    # Get institution code if institution name is available
+    institution_code = ""
+    if institution:
+        institution_code = match_institution_code(institution, institution_df)
+        
+    # Display institution name and code at the top
+    if institution:
+        if institution_code:
+            st.header(f"Institution: {institution} (Code: {institution_code})")
+        else:
+            st.header(f"Institution: {institution}")
         
     for term_data in json_data:
         term = term_data.get("term", "")
@@ -514,8 +683,8 @@ def display_transcript_data(json_data):
                 "MACU Course Code": course.get("macu_course_code", ""),
                 "MACU Course Title": course.get("macu_course_title", ""),
                 "MACU Credits": course.get("macu_credits", ""),
-                "Data From": course.get("data_from", ""),
-                #"CombineTitleCode": course.get("CombineTitleCode", ""),
+                "MACU Division": course.get("macu_division", ""),
+                "Data From": course.get("data_from", "")
             }
             for course in courses
         ])
@@ -542,7 +711,6 @@ def show_feedback_dialog():
                 st.success("Thank you for your feedback!")
                 return True, feedback
         elif skip_button:
-            # Return a special flag to indicate feedback was skipped
             return "skipped", None
     return False, None
 
@@ -581,7 +749,6 @@ def save_pdf_to_drive(pdf_bytes: bytes, filename: str):
         return False, f"Failed to save PDF to Google Drive: {str(e)}"
     
     finally:
-        # Clean up in finally block to ensure it runs even if there's an exception
         if temp_file and os.path.exists(temp_file_path):
             try:
                 # Try to close and delete the file
@@ -593,9 +760,6 @@ def save_pdf_to_drive(pdf_bytes: bytes, filename: str):
 def save_to_google_sheet(file_url, json_data, user_comment):
     try:
         import gspread
-        # Removed debug outputs
-        
-        # Use service account info from secrets
         credentials = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"],
             scopes=[
@@ -626,7 +790,7 @@ def load_macu_mappings_from_sheets():
                 'https://www.googleapis.com/auth/drive.readonly'
             ]
         )
-        # Create gspread client
+
         gc = gspread.authorize(credentials)
         spreadsheet_id = "1p2_1E25dYfWWb2ugfsFSdDPss-ahzGBxaQ41YUkVRK4"
         try:
@@ -635,21 +799,18 @@ def load_macu_mappings_from_sheets():
         except Exception as e:
             st.error(f"Failed to open spreadsheet: {str(e)}")
             return pd.DataFrame()
-        # Define target sheets
+
         target_sheets = ["2020-2021", "2021-2022", "2022-2023", "2023-2024", "2024-2025","2025-2026"]
         all_data = pd.DataFrame()
         for sheet_name in target_sheets:
             try:
-                # Get the worksheet
                 try:
                     sheet = spreadsheet.worksheet(sheet_name)
                     # Removed debug output
                 except gspread.exceptions.WorksheetNotFound:
                     st.warning(f"Sheet '{sheet_name}' not found in spreadsheet")
                     continue
-                # Removed debug output
-                
-                # Get all values from the sheet
+
                 sheet_values = sheet.get_all_values()
                 # Skip empty sheets
                 if not sheet_values or len(sheet_values) <= 2:  # Need at least header row + column names + one data row
@@ -659,9 +820,6 @@ def load_macu_mappings_from_sheets():
                 data = sheet_values[2:]
                 df = pd.DataFrame(data, columns=headers)
                 df['source_sheet'] = sheet_name
-                
-                # Removed expander for sample data
-                
                 # Append to the main DataFrame
                 all_data = pd.concat([all_data, df], ignore_index=True)
                 # Removed debug output
@@ -698,6 +856,7 @@ Extract the following information from the provided PDF transcript file.
 - Only extract courses that were taken and completed **at the issuing institution**.
 
 ### **Step 3: Extract the Required Information**
+First, extract the **Institution Name** from the transcript header or title section.
 For each term, extract the following details:
 
 - **Term:** Identify the academic term (Fall, Summer, Spring).
@@ -724,6 +883,7 @@ Return the extracted data in the following **JSON structure**:
 ```json
 [
   {
+    "institution": "Langston University",
     "term": "Fall",
     "year": "2023",
     "courses": [
@@ -731,21 +891,24 @@ Return the extracted data in the following **JSON structure**:
         "course_code": "CS101",
         "division": "UNDG",
         "title": "Real-Time Text and voice output enabled traffic sign detection system using deep learning",
-        "short_title: "Real-Time Traffic Sign Detection",
+        "short_title": "Real-Time Traffic Sign Detection",
         "credits": 3,
-        "grade": "A"
+        "grade": "A",
+        "points": 12
       },
       {
         "course_code": "MATH202",
         "division": "UNDG",
         "title": "Calculus II",
         "short_title": "Calculus II",
-        "credit_hours": 4,
-        "grade": "B+"
+        "credits": 4,
+        "grade": "B+",
+        "points": 13.2
       }
     ]
   },
   {
+    "institution": "Langston University",
     "term": "Spring",
     "year": "2024",
     "courses": [
@@ -755,11 +918,13 @@ Return the extracted data in the following **JSON structure**:
         "title": "Advanced Calculus",
         "short_title": "Advanced Calculus",
         "credits": 4,
-        "grade": "A-"
+        "grade": "A-",
+        "points": 14.8
       }
     ]
   }
 ]
+```
 
 ## **Additional Considerations**
 - If "CRED" is missing, calculate credits using: CRED = Points/Grade where grade values are A=4.0, B=3.0, C=2.0, D=1.0, F=0.0
@@ -767,26 +932,17 @@ Return the extracted data in the following **JSON structure**:
 - Ensure that each course is correctly associated with its respective term and year.
 - Make sure to extract and include the "points" field in the output as it's needed for credit calculation.
 - If any required information is missing from a course, leave the value as an empty string ("") rather than omitting the field.
+- The institution name should be included at the term level in the JSON structure.
 """
-# Replace the original function with the new implementation
-
 def main():
     st.set_page_config(page_title="Transcript Analyzer", layout="wide")
     st.title("🔍 Academic Transcript Analyzer")
     
-    # Initialize session state variables if they don't exist
-    if "pdf_processed" not in st.session_state:
-        st.session_state["pdf_processed"] = False
-    if "feedback_submitted" not in st.session_state:
-        st.session_state["feedback_submitted"] = False
-    if "feedback_skipped" not in st.session_state:
-        st.session_state["feedback_skipped"] = False
-    if "uploaded_file_name" not in st.session_state:
-        st.session_state["uploaded_file_name"] = None
-    if "pdf_bytes" not in st.session_state:
-        st.session_state["pdf_bytes"] = None
-    if "drive_upload_status" not in st.session_state:
-        st.session_state["drive_upload_status"] = None
+    # Initialize session state variables
+    for key in ["pdf_processed", "feedback_submitted", "feedback_skipped", 
+                "uploaded_file_name", "pdf_bytes", "drive_upload_status"]:
+        if key not in st.session_state:
+            st.session_state[key] = False if key in ["pdf_processed", "feedback_submitted", "feedback_skipped"] else None
     
     # Step 1: Ask for password
     if not check_password():
@@ -800,6 +956,14 @@ def main():
         st.success("Previous PDF was successfully saved to Google Drive.")
         # Clear the status to avoid showing it repeatedly
         st.session_state["drive_upload_status"] = None
+    
+    # Load institution mappings ONCE and store in session state
+    if "institution_df" not in st.session_state:
+        with st.spinner("Loading institution data..."):
+            institution_df = load_institution_mappings()
+            st.session_state["institution_df"] = institution_df
+            if not institution_df.empty:
+                st.success(f"Loaded institution mappings: {len(institution_df)} entries")
     
     # Always show the file uploader
     st.write("Upload a PDF transcript to extract course information.")
@@ -852,7 +1016,6 @@ def main():
     
     # Process the uploaded file (if any)
     if uploaded_file is not None:
-        # Update the session state with the new file
         pdf_bytes = uploaded_file.getvalue()
         st.session_state["pdf_bytes"] = pdf_bytes
         st.session_state["uploaded_file_name"] = uploaded_file.name
@@ -864,34 +1027,32 @@ def main():
             st.session_state["feedback_skipped"] = False
             st.session_state["pdf_processed"] = False
             
-            # Call Claude API to analyze the PDF
-            claude_response = analyze_pdf(pdf_bytes, PROMPT)
-            # Extract JSON from Claude's response
+            claude_response, token_usage = analyze_pdf(pdf_bytes, PROMPT)
             json_data = extract_json(claude_response)
-            # Post-process the data
+            
             if json_data:
                 json_data = post_process_transcript_data(json_data)
-                # Load mapping data from all sheets
                 macu_df = load_macu_mappings_from_sheets()
-                # Load CEQMACU mapping data
                 ceqmacu_df = load_ceqmacu_mappings()
-                # Enrich with MACU course equivalents
                 json_data = enrich_with_macu_data(json_data, macu_df, ceqmacu_df)
-
                 st.session_state["json_data"] = json_data
-                # Display the data
+                
                 st.success("Transcript processed successfully!")
-                # Add download button for JSON
                 st.download_button(
                     label="Download JSON Data",
                     data=json.dumps(json_data, indent=4),
                     file_name=f"{uploaded_file.name.split('.')[0]}_processed.json",
                     mime="application/json"
                 )
-                                    
-                # Display the transcript data in tables
+                
+                # Display token usage details in an expander
+                with st.expander("API Token Usage Details"):
+                    st.markdown(token_usage)
+                
+                # Use the display function without passing institution_df
+                # as it's now accessed from session state
                 display_transcript_data(json_data)
-                # Show raw JSON in an expander
+                
                 with st.expander("View Raw JSON Data"):
                     st.json(json_data)
                 
