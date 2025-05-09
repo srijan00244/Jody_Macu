@@ -271,11 +271,13 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
         st.warning("No CEP mapping data available.")
         return json_data
     import re
+    
     def normalize(text):
         if pd.isna(text) or text is None:
             return ""
         # Replace hyphens with spaces in the text
         text = str(text).strip().lower().replace('-', ' ')
+        # Add space between letters and numbers for consistent matching
         text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
         return text
     
@@ -297,6 +299,36 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
             
         return academic_year
     
+    # Improved extract_course_code function
+    def extract_course_code(combined_text):
+        if pd.isna(combined_text) or combined_text is None:
+            return ""
+        
+        # First try a more robust pattern that looks for a subject code followed by a course number
+        # This captures patterns like "COMM 1313", "ENGL 101", "BIO 2010", etc.
+        match = re.match(r'^([A-Za-z]+)\s*(\d+)', str(combined_text), re.IGNORECASE)
+        if match:
+            subject = match.group(1).strip()
+            number = match.group(2).strip()
+            return normalize(f"{subject} {number}")
+        
+        # Fallback to the original pattern
+        match = re.match(r'^([A-Za-z0-9\s\.]+?)(?:\s{2,}|\s+[^A-Za-z0-9\s\.])', str(combined_text))
+        if match:
+            return normalize(match.group(1))
+        else:
+            # Final fallback: try to get the first word with numbers (likely the course code)
+            words = str(combined_text).split()
+            for i, word in enumerate(words):
+                if any(c.isdigit() for c in word) and i > 0:
+                    return normalize(f"{words[i-1]} {word}")  # Subject code + course number
+            
+            # If nothing else works, just take the first two words if available
+            if len(words) >= 2:
+                return normalize(f"{words[0]} {words[1]}")
+            return normalize(str(combined_text).split()[0]) if words else ""
+    
+    # Create a more efficient structure for course code lookup
     # Use the CombineTitleCode column for matching
     combine_column = 'CombineTitleCode'
     if combine_column not in macu_df.columns:
@@ -310,39 +342,31 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
             st.error("No suitable column found for combined course code and title matching")
             return json_data
     
-    # Extract course code from the combined column and create a new column for course code matching
-    def extract_course_code(combined_text):
-        if pd.isna(combined_text) or combined_text is None:
-            return ""
-
-        match = re.match(r'^([A-Za-z0-9\s\.]+?)(?:\s{2,}|\s+[^A-Za-z0-9\s\.])', str(combined_text))
-        if match:
-            return normalize(match.group(1))
-        else:
-            # If pattern doesn't match, try to get the first word with numbers (likely the course code)
-            words = str(combined_text).split()
-            for word in words:
-                if any(c.isdigit() for c in word):
-                    return normalize(words[0] + " " + word)  # Subject code + course number
-            # Fallback: just take the first two words
-            if len(words) >= 2:
-                return normalize(words[0] + " " + words[1])
-            return normalize(str(combined_text).split()[0]) if combined_text else ""
-    
     # Create normalized columns for matching
     macu_df['combine_normalized'] = macu_df[combine_column].apply(normalize)
     macu_df['common_code_normalized'] = macu_df['CommonCode'].apply(normalize)
     macu_df['course_code_extracted'] = macu_df[combine_column].apply(extract_course_code)
+    
     # Create a column with just the course code for secondary matching
     if 'CourseCode' in macu_df.columns:
         macu_df['course_code_normalized'] = macu_df['CourseCode'].apply(normalize)
     
+    # Create course code lookup dictionary for faster matching
+    course_code_lookup = {}
+    
     # Create filtered dataframes for each academic year
     academic_year_dfs = {}
     available_sheets = ['2020-2021', '2021-2022', '2022-2023', '2023-2024', '2024-2025', '2025-2026']
+    
     for sheet_name in available_sheets:
         sheet_df = macu_df[macu_df['source_sheet'] == sheet_name].copy()
         academic_year_dfs[sheet_name] = sheet_df
+        
+        # Create a lookup dictionary for course codes in this sheet
+        for _, row in sheet_df.iterrows():
+            code = row['course_code_extracted']
+            if code and code not in course_code_lookup:
+                course_code_lookup[code] = sheet_name
     
     # Create a specific dataframe for MACU institution rows for the second lookup
     macu_institution_df = macu_df[macu_df['Institution'] == 'MACU'].copy()
@@ -397,6 +421,9 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
             course["CombineTitleCode"] = combined_text
             course["term_academic_year"] = academic_year
             
+            # DEBUG: Log the course being processed
+            # st.write(f"Processing course: {course_code} - {title}")
+            
             # Mark courses from older terms explicitly
             if is_old_term:
                 older_courses += 1
@@ -404,7 +431,7 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
                 # For older terms, skip CEP matching and try CEQMACU directly
                 cep_match_found = False
                 
-                # Add a note to indicate why no match was found
+                # Add a note to indicate why no match was found in CEP
                 course["data_from"] = ""
                 course["no_match_reason"] = f"Term ({term_name} {year}) is before earliest available data (2020-2021)"
             else:
@@ -413,8 +440,16 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
                 
                 # MATCH METHOD 1: Try to find an exact match by course code only in the current academic year
                 if not current_academic_year_df.empty:
+                    # Print normalized course code for debugging
+                    # st.write(f"Looking for course code: {course_code_normalized}")
+                    
                     # First try an exact course code match
-                    matching_rows = current_academic_year_df[current_academic_year_df['course_code_extracted'] == course_code_normalized]
+                    # Using both original and normalized course codes to increase matching chances
+                    matching_rows = current_academic_year_df[
+                        (current_academic_year_df['course_code_extracted'] == course_code_normalized) |
+                        (current_academic_year_df['course_code_extracted'] == course_code.lower().strip())
+                    ]
+                    
                     if not matching_rows.empty:
                         # We found a matching course in the expected academic year sheet by course code
                         match = matching_rows.iloc[0]
@@ -499,8 +534,12 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
                             continue
                         
                         # First try to match by course code
-                        matching_rows = sheet_df[sheet_df['course_code_extracted'] == course_code_normalized]
+                        matching_rows = sheet_df[
+                            (sheet_df['course_code_extracted'] == course_code_normalized) |
+                            (sheet_df['course_code_extracted'] == course_code.lower().strip())
+                        ]
                         match_type = "course_code_exact_different_year"
+                        
                         # If no match by course code, try combined text
                         if matching_rows.empty:
                             matching_rows = sheet_df[sheet_df['combine_normalized'] == combined_normalized]
@@ -538,7 +577,12 @@ def enrich_with_macu_data(json_data, macu_df, ceqmacu_df=None):
             
             # MATCH METHOD 4: If no match in CEP data, try CEQMACU data
             if not cep_match_found and ceqmacu_available:
-                ceqmacu_matches_df = ceqmacu_df[ceqmacu_df['send_course_code_normalized'] == course_code_normalized]
+                # Try to match by exact course code first
+                ceqmacu_matches_df = ceqmacu_df[
+                    (ceqmacu_df['send_course_code_normalized'] == course_code_normalized) |
+                    (ceqmacu_df['send_course_code_normalized'] == course_code.lower().strip())
+                ]
+                
                 if not ceqmacu_matches_df.empty:
                     valid_year_matches = []
                     
